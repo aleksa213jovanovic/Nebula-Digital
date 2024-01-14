@@ -1,0 +1,29 @@
+version: '3.8'
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile-app
+    ports:
+      - "8081:8081"
+    depends_on:
+      - db
+    environment:
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_USER=user
+      - DB_PASSWORD=password
+      - DB_NAME=transactionservice
+
+  db:
+    build:
+      context: .
+      dockerfile: Dockerfile-db
+    ports:
+      - "5438:5432"
+    environment:
+      POSTGRES_DB: transactionservice
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+    volumes:
+      - ./init_db.sql:/docker-entrypoint-initdb.d/init_db.sql

@@ -1,0 +1,16 @@
+# Use the official PostgreSQL image as a base image
+FROM postgres:latest
+
+# Environment variables for the PostgreSQL
+ENV POSTGRES_DB=userservice
+ENV POSTGRES_USER=user
+ENV POSTGRES_PASSWORD=password
+
+# Copy the database script to the docker-entrypoint-initdb.d directory
+COPY ./init_db.sql /docker-entrypoint-initdb.d/
+
+# When the container starts, PostgreSQL will execute any .sql file found in this directory.
+
+
+# build docker image ==> docker build -t myuserpostgredb -f Dockerfile-db . <== there is a dot at the end of the line
+# then run the container ==> docker run -d -p 5437:5432 --name userpostgredb myuserpostgredb

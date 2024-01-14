@@ -1,0 +1,33 @@
+# Start from the official Golang image
+FROM golang:1.19 AS builder
+
+# Set the working directory in the container
+WORKDIR /app
+
+# Copy the Go modules and sum files
+COPY go.mod go.sum ./
+
+# Download all dependencies
+RUN go mod download
+
+# Copy the source code into the container
+COPY . .
+
+# Build the application
+RUN go build -o myapp .
+
+# Use a smaller image to run the compiled app
+FROM alpine:latest
+
+RUN apk --no-cache add ca-certificates
+
+WORKDIR /root/
+
+# Copy the compiled app from the builder stage
+COPY --from=builder /app/myapp .
+
+# Expose port (if your app listens on a port)
+EXPOSE 8081
+
+# Run the executable
+CMD ["./myapp"]
