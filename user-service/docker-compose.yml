@@ -1,22 +1,5 @@
 version: '3.8'
 services:
-  app:
-    build:
-      context: .
-      dockerfile: Dockerfile-app
-    ports:
-      - "8082:8082"
-    depends_on:
-      - db
-    environment:
-      - DB_HOST=db
-      - DB_PORT=5432
-      - DB_USER=user
-      - DB_PASSWORD=password
-      - DB_NAME=userservice
-      - APP_PORT=8082
-      - KAFKA_BOOTSTRAP_SERVER=
-
   db:
     build:
       context: .
@@ -29,3 +12,27 @@ services:
       POSTGRES_PASSWORD: password
     volumes:
       - ./init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d userservice -h localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile-app
+    ports:
+      - "8082:8082"
+    depends_on:
+        db:
+          condition: service_healthy
+    environment:
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_USER=user
+      - DB_PASSWORD=password
+      - DB_NAME=userservice
+      - APP_PORT=8082
+      - KAFKA_BOOTSTRAP_SERVER=

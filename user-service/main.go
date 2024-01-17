@@ -15,6 +15,7 @@ import (
 
 	"github.com/lib/pq"
 	_ "github.com/lib/pq"
+	"github.com/nats-io/nats.go"
 
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 )
@@ -56,7 +57,7 @@ func main() {
 
 	fmt.Printf("db connection succesfully established\n")
 
-	// _ = db.QueryRow("insert into users (email) values ($1)", "test@email")
+	fmt.Printf("connecting to kafka server\n")
 
 	conf := ReadConfig("./kafka.server.properties")
 	err = conf.SetKey("enable.idempotence", true)
@@ -70,25 +71,42 @@ func main() {
 		log.Fatalf("failed to create kafka producer, %v\n", err)
 	}
 
-	defer p.Flush(15 * 1000) // todo check this
+	defer p.Flush(15 * 1000)
 	defer p.Close()
+
+	fmt.Printf("succesfully connected to kafka\n")
+
+	fmt.Printf("connecting to nats\n")
+
+	natsUri, err := GetErr("NATS_URI")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// natsUri := "http://localhost:4222"
+	nc, err := nats.Connect(natsUri)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer nc.Close()
+
+	fmt.Printf("succesfully connected to ants\n")
 
 	// Wait for all messages to be delivered
 
-	err = setRouter(db, p)
+	err = setRouter(db, p, nc)
 	if err != nil {
 		log.Fatalf("%v\n", err)
 	}
 }
 
-func setRouter(db *sql.DB, p *kafka.Producer) error {
+func setRouter(db *sql.DB, p *kafka.Producer, nc *nats.Conn) error {
 
-	port := "8083"
-	// todo
-	// port, err := GetErr("APP_PORT")
-	// if err != nil {
-	// 	return err
-	// }
+	// port := "8082"
+	port, err := GetErr("APP_PORT")
+	if err != nil {
+		return err
+	}
 
 	server := http.Server{
 		Addr: fmt.Sprintf(":%s", port),
@@ -97,38 +115,123 @@ func setRouter(db *sql.DB, p *kafka.Producer) error {
 	handler := handler{
 		db:            db,
 		kafkaProducer: p,
+		nats:          nc,
 	}
 
-	http.HandleFunc("/user-service/create/user", handler.createUserHandler)
+	http.HandleFunc("/user-service/user/create", handler.createUserHandler)
+	http.HandleFunc("/user-service/user/balance", handler.userBalanceHandler)
 
 	log.Printf("Starting server on :%s\n", port)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return err
 	}
 
-	// todo
-	// go func() {
-	// 	log.Println("Starting server on :8082")
-	// 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-	// 		log.Fatalf("Could not listen on :8082: %v\n", err)
-	// 	}
-	// }()
-
 	return nil
+}
+
+func (h *handler) userBalanceHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "Method is not supported.", http.StatusMethodNotAllowed)
+		return
+	}
+
+	type requestBody struct {
+		Email string `json:"email"`
+	}
+
+	req := requestBody{}
+
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	email := req.Email
+
+	userBalance, err := fetchUserBalance(h.db, h.nats, email)
+	if err != nil {
+		http.Error(w, "fail", http.StatusInternalServerError)
+		return
+	}
+
+	type responseBody struct {
+		Email   string  `json:"email"`
+		Balance float64 `json:"balance"`
+	}
+
+	res := &responseBody{
+		Email:   email,
+		Balance: userBalance,
+	}
+
+	payload, err := json.Marshal(res)
+	if err != nil {
+		http.Error(w, "fail", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(payload)
+
+}
+
+func fetchUserBalance(db *sql.DB, nc *nats.Conn, email string) (float64, error) {
+	// send request to nats io
+	// return response in http response body
+
+	fmt.Printf("fetching userid\n")
+
+	query := fmt.Sprintf("SELECT user_id FROM users WHERE email='%s'", email)
+
+	var userId int
+	err := db.QueryRow(query).Scan(&userId)
+	if err != nil {
+		return 0, err
+	}
+
+	fmt.Printf("user id = %d\n", userId)
+
+	type request struct {
+		UserId int `json:"userId"`
+	}
+
+	req := &request{
+		userId,
+	}
+
+	payload, err := json.Marshal(req)
+	if err != nil {
+		fmt.Printf("%v\n", err)
+		return 0, err
+	}
+
+	natsResponse, err := nc.Request("userBalance", payload, 5*time.Second)
+	if err != nil {
+		fmt.Printf("%v\n", err)
+		return 0, err
+	}
+
+	type response struct {
+		UserBalance float64 `json:"userBalance"`
+	}
+
+	resp := response{}
+
+	err = json.Unmarshal(natsResponse.Data, &resp)
+	if err != nil {
+		fmt.Printf("%v\n", err)
+		return 0, err
+	}
+
+	return resp.UserBalance, nil
 }
 
 type handler struct {
 	db            *sql.DB
 	kafkaProducer *kafka.Producer
-}
-
-type CreateUserRequest struct {
-	Email string `json:"email"`
-}
-
-type User struct {
-	Email  string `json:"email"`
-	UserId int    `json:"userId"`
+	nats          *nats.Conn
 }
 
 func (h *handler) createUserHandler(w http.ResponseWriter, r *http.Request) {
@@ -137,7 +240,11 @@ func (h *handler) createUserHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req CreateUserRequest
+	type createUserRequest struct {
+		Email string `json:"email"`
+	}
+
+	var req createUserRequest
 	err := json.NewDecoder(r.Body).Decode(&req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -147,7 +254,7 @@ func (h *handler) createUserHandler(w http.ResponseWriter, r *http.Request) {
 	// Extracted email
 	email := req.Email
 
-	userId, err := InsertUser(h.db, req)
+	userId, err := InsertUser(h.db, req.Email)
 	if err != nil {
 		if err.Error() == "user already exists" {
 			http.Error(w, err.Error(), http.StatusConflict)
@@ -158,7 +265,12 @@ func (h *handler) createUserHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	newUser := &User{
+	type createUserResponse struct {
+		Email  string `json:"email"`
+		UserId int    `json:"user_id"`
+	}
+
+	newUser := &createUserResponse{
 		Email:  req.Email,
 		UserId: userId,
 	}
@@ -184,6 +296,7 @@ func (h *handler) createUserHandler(w http.ResponseWriter, r *http.Request) {
 		RemoveUser(userId, h.db)
 		fmt.Printf("%v\n", err)
 		http.Error(w, "fail", http.StatusInternalServerError)
+		return
 	}
 
 	go func() {
@@ -217,21 +330,21 @@ func (h *handler) createUserHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "fail", http.StatusInternalServerError)
 	}
 
-	// todo check if new user is recorded in transaction service
+	close(kafkaSucceeded)
 }
 
-func InsertUser(db *sql.DB, user CreateUserRequest) (int, error) {
-	// SQL statement to insert a new user
+func InsertUser(db *sql.DB, userEmail string) (int, error) {
+	// SQL statement to insert a new userEmail
 	query := `INSERT INTO users (email) VALUES ($1) RETURNING user_id`
 
 	var userID int
-	err := db.QueryRow(query, user.Email).Scan(&userID)
+	err := db.QueryRow(query, userEmail).Scan(&userID)
 	if err != nil {
 		// Check if the error is due to a duplicate entry
 		if pqErr, ok := err.(*pq.Error); ok {
 			// Here "23505" is the PostgreSQL error code for "unique_violation"
 			if pqErr.Code == "23505" {
-				return -1, fmt.Errorf("user already exists")
+				return -1, fmt.Errorf("user email already exists")
 			}
 		}
 		return -1, err
@@ -282,9 +395,8 @@ func ReadConfig(configFile string) kafka.ConfigMap {
 }
 
 func buildDBUrl() (string, error) {
-	return "postgres://user:password@localhost:5437/userservice?sslmode=disable", nil
+	// return "postgresql://user:password@localhost:5437/userservice?sslmode=disable", nil
 
-	// todo docker
 	dbUrl := ""
 	host, err := GetErr("DB_HOST")
 	if err != nil {

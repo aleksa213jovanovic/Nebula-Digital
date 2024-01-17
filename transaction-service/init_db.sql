@@ -5,8 +5,6 @@ CREATE TABLE users (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- PostgreSQL doesn't have a built-in ENUM type like MySQL.
--- You can create one as follows:
 CREATE TYPE transaction_type AS ENUM ('credit', 'debit');
 
 DROP TABLE IF EXISTS transactions;

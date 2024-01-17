@@ -1,33 +1,22 @@
-# Start from the official Golang image
-FROM golang:1.19 AS builder
+# Specifies a parent image
+FROM golang:1.19-bullseye
 
-# Set the working directory in the container
+# Creates an app directory to hold your app’s source code
 WORKDIR /app
 
-# Copy the Go modules and sum files
-COPY go.mod go.sum ./
-
-# Download all dependencies
-RUN go mod download
-
-# Copy the source code into the container
+# Copies everything from your root directory into /app
 COPY . .
 
-# Build the application
-RUN go build -o myapp main.go
 
-# Use a smaller image to run the compiled app
-FROM alpine:latest
+RUN go mod tidy
+# Installs Go dependencies
+RUN go mod download
 
-RUN apk --no-cache add ca-certificates
+# Builds your app with optional configuration
+RUN go build -o /godocker
 
-WORKDIR /root/
-
-# Copy the compiled app from the builder stage
-COPY --from=builder /app/myapp .
-
-# Expose port (if your app listens on a port)
+# Tells Docker which network port your container listens on
 EXPOSE 8082
 
-# Run the executable
-CMD ["./myapp"]
+# Specifies the executable command that runs when the container starts
+CMD ["/godocker" ]

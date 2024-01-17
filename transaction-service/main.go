@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -19,6 +20,7 @@ import (
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"github.com/lib/pq"
 	_ "github.com/lib/pq"
+	"github.com/nats-io/nats.go"
 )
 
 func main() {
@@ -58,54 +60,270 @@ func main() {
 
 	fmt.Printf("db connection succesfully established\n")
 
-	go setConsumer(db)
+	fmt.Printf("connecting to nats\n")
 
-	setRouter(db)
+	natsUri, err := GetErr("NATS_URI")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// natsUri := "http://localhost:4222"
+	nc, err := nats.Connect(natsUri)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer nc.Close()
+
+	fmt.Printf("succesfully connected to nats\n")
+
+	kafkaCtx, cancelKafka := context.WithCancel(context.Background())
+
+	go setKafkaConsumer(db, kafkaCtx)
+	setNatsWorker(db, nc)
+
+	server, err := setRouter(db, nc)
+	if err != nil {
+		fmt.Printf("%v\n", err)
+	}
+
+	stopChan := make(chan os.Signal, 1)
+	signal.Notify(stopChan, syscall.SIGINT, syscall.SIGTERM)
+
+	//  Block until we receive our signal
+	<-stopChan
+	cancelKafka()
+	fmt.Println("Shutting down server...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err = server.Shutdown(ctx)
+	if err != nil {
+		fmt.Printf("%v\n", err)
+	}
+
+	fmt.Println("Server gracefully stopped")
+
 }
 
-func setRouter(db *sql.DB) error {
+func setNatsWorker(db *sql.DB, nc *nats.Conn) {
 
-	port := "8082"
-	// todo
-	// port, err := GetErr("APP_PORT")
-	// if err != nil {
-	// 	return err
-	// }
+	_, err := nc.Subscribe("userBalance", func(m *nats.Msg) {
+		log.Printf("Received a message: %s\n", string(m.Data))
+
+		type request struct {
+			UserId int `json:"userId"`
+		}
+
+		req := request{}
+
+		err := json.Unmarshal(m.Data, &req)
+		if err != nil {
+			fmt.Printf("%v\n", err)
+			return
+		}
+
+		query := fmt.Sprintf("SELECT balance FROM users WHERE user_id='%d'", req.UserId)
+
+		var userBalance float64
+		err = db.QueryRow(query).Scan(&userBalance)
+		if err != nil {
+			fmt.Printf("%v\n", err)
+			return
+		}
+
+		type response struct {
+			UserBalance float64 `json:"userBalance"`
+		}
+
+		b := response{
+			UserBalance: userBalance,
+		}
+
+		payload, err := json.Marshal(b)
+		if err != nil {
+			fmt.Printf("%v\n", err)
+			return
+		}
+
+		err = nc.Publish(m.Reply, payload)
+		if err != nil {
+			fmt.Printf("%v\n", err)
+		}
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func setRouter(db *sql.DB, nc *nats.Conn) (*http.Server, error) {
+
+	// port := "8081"
+	port, err := GetErr("APP_PORT")
+	if err != nil {
+		return nil, err
+	}
 
 	server := http.Server{
 		Addr: fmt.Sprintf(":%s", port),
 	}
 
-	handler := handler{
-		db: db,
+	h := handler{
+		db:   db,
+		nats: nc,
 	}
 
-	http.HandleFunc("/transaction-service/fetch/user", handler.fetchUser)
+	http.HandleFunc("/transaction-service/fetch/user", h.fetchUser)
+	http.HandleFunc("/transaction-service/user/credit", h.userCredit)
+	http.HandleFunc("/transaction-service/user/transfer", h.userTransfer)
 
-	log.Printf("Starting server on :%s\n", port)
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		fmt.Printf("%v\n", err)
-		return err
-	}
+	go func() {
+		log.Printf("Starting server on :%s\n", port)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			fmt.Printf("%v\n", err)
+			return
+		}
+	}()
 
-	// todo
-	// go func() {
-	// 	log.Println("Starting server on :8082")
-	// 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-	// 		log.Fatalf("Could not listen on :8082: %v\n", err)
-	// 	}
-	// }()
-
-	return nil
+	return &server, nil
 }
 
 type handler struct {
-	db *sql.DB
+	db   *sql.DB
+	nats *nats.Conn
 }
 
 type User struct {
 	Email  string `json:"email"`
-	UserId int    `json:"userId"`
+	UserId int    `json:"user_id"`
+}
+
+func (h *handler) userTransfer(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method is not supported.", http.StatusMethodNotAllowed)
+		return
+	}
+
+	type UserTransfer struct {
+		FromId int     `json:"from_user_id"`
+		ToId   int     `json:"to_user_id"`
+		Amount float64 `json:"amount_to_transfer"`
+	}
+
+	var req UserTransfer
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	err = transfer(h.db, req.FromId, req.ToId, req.Amount)
+	if err != nil {
+		fmt.Printf("%v\n", err)
+		http.Error(w, "fail", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+}
+
+func transfer(db *sql.DB, fromId int, toId int, amount float64) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+
+	_, err = tx.Exec("UPDATE users SET balance = balance + $1 WHERE user_id = $2", -amount, fromId)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	_, err = tx.Exec("UPDATE users SET balance = balance + $1 WHERE user_id = $2", amount, toId)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	_, err = tx.Exec("INSERT INTO transactions (user_id, amount, transaction_type) VALUES ($1, $2, 'debit')", fromId, amount)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	_, err = tx.Exec("INSERT INTO transactions (user_id, amount, transaction_type) VALUES ($1, $2, 'credit')", toId, amount)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	return tx.Commit()
+}
+
+func (h *handler) userCredit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method is not supported.", http.StatusMethodNotAllowed)
+		return
+	}
+
+	type UserCredit struct {
+		UserId int     `json:"user_id"`
+		Amount float64 `json:"amount"`
+	}
+
+	var req UserCredit
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	newBalance, err := credit(h.db, req.UserId, req.Amount)
+	if err != nil {
+		http.Error(w, "fail", http.StatusInternalServerError)
+		return
+	}
+
+	type response struct {
+		UpdatedBalance float64 `json:"updated_balance:"`
+	}
+
+	jsonResponse, err := json.Marshal(response{UpdatedBalance: newBalance})
+	if err != nil {
+		fmt.Printf("%v\n", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(jsonResponse)
+
+}
+
+func credit(db *sql.DB, userId int, amount float64) (float64, error) {
+	var newBalance float64
+
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, err
+	}
+
+	err = tx.QueryRow("UPDATE users SET balance = balance + $1 WHERE user_id = $2 RETURNING balance", amount, userId).Scan(&newBalance)
+	if err != nil {
+		tx.Rollback()
+		return 0, err
+	}
+
+	_, err = tx.Exec("INSERT INTO transactions (user_id, amount, transaction_type) VALUES ($1, $2, 'credit')", userId, amount)
+	if err != nil {
+		tx.Rollback()
+		return 0, err
+	}
+
+	// Commit the transaction
+	return newBalance, tx.Commit()
 }
 
 func (h *handler) fetchUser(w http.ResponseWriter, r *http.Request) {
@@ -134,7 +352,6 @@ func (h *handler) fetchUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Set Content-Type header and write the JSON response
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	w.Write(jsonResponse)
@@ -165,7 +382,7 @@ func FindUser(db *sql.DB, userId int) (*FoundUser, error) {
 	return &user, nil
 }
 
-func setConsumer(db *sql.DB) {
+func setKafkaConsumer(db *sql.DB, ctx context.Context) {
 	conf := ReadConfig("./kafka.server.properties")
 	conf["group.id"] = "kafka-go-getting-started"
 	conf["auto.offset.reset"] = "earliest"
@@ -188,13 +405,15 @@ func setConsumer(db *sql.DB) {
 	run := true
 	for run {
 		select {
-		case sig := <-sigchan:
-			fmt.Printf("Caught signal %v: terminating\n", sig)
-			run = false
+		case <-ctx.Done():
+			log.Println("kafka consumer stopped")
+			return
 		default:
 			ev, err := c.ReadMessage(100 * time.Millisecond)
 			if err != nil {
-				// Errors are informational and automatically handled by the consumer
+				if err.Error() != "Local: Timed out" {
+					fmt.Printf("%v\n", err)
+				}
 				continue
 			}
 			fmt.Printf("Consumed event from topic %s: key = %-10s value = %s\n",
@@ -218,7 +437,6 @@ func setConsumer(db *sql.DB) {
 			}
 		}
 	}
-
 }
 
 func InsertUser(db *sql.DB, user *User) (int, error) {
@@ -242,9 +460,8 @@ func InsertUser(db *sql.DB, user *User) (int, error) {
 }
 
 func buildDBUrl() (string, error) {
-	return "postgres://user:password@localhost:5438/transactionservice?sslmode=disable", nil
+	// return "postgres://user:password@localhost:5438/transactionservice?sslmode=disable", nil
 
-	// todo docker
 	dbUrl := ""
 	host, err := GetErr("DB_HOST")
 	if err != nil {
